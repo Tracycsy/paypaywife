@@ -623,9 +623,11 @@
     </div>
     <div class="header-actions">
       <button class="btn-icon" onclick="exportCSV()" title="匯出 CSV">📥</button>
+      <button class="btn-icon" onclick="document.getElementById('import-file-input').click()" title="匯入 CSV">📤</button>
       <button class="btn-icon" onclick="confirmReset()" title="重置所有紀錄">🗑️</button>
     </div>
   </div>
+  <input type="file" id="import-file-input" accept=".csv" style="display:none" onchange="handleImportFile(event)">
   <div class="balance-card" id="balance-card">
     <div class="bal-status-row">
       <span class="bal-status-pill" id="bal-pill">—</span>
@@ -761,6 +763,20 @@
     <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px">
       <button class="btn-cancel" onclick="closeModal()">取消</button>
       <button class="btn-settle" style="padding:11px;width:100%" onclick="executeSettle()">確認</button>
+    </div>
+  </div>
+</div>
+
+<!-- IMPORT MODAL -->
+<div class="modal-overlay" id="import-modal-overlay" onclick="closeImportModal(event)">
+  <div class="modal">
+    <div class="modal-title">📤 匯入 CSV</div>
+    <p style="font-size:13px;color:var(--text-dim);margin-bottom:12px;" id="import-preview-text"></p>
+    <div style="background:var(--surface2);border:1px solid var(--border-dim);border-radius:var(--radius-sm);padding:10px 12px;margin-bottom:14px;font-size:12px;color:var(--text-dim);max-height:140px;overflow-y:auto;" id="import-preview-list"></div>
+    <p style="font-size:12px;color:var(--text-muted);margin-bottom:14px;">現有紀錄將保留，只新增 CSV 中未有的項目。</p>
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px">
+      <button class="btn-cancel" onclick="closeImportModal()">取消</button>
+      <button class="btn-primary" style="margin-top:0;font-size:14px;padding:11px" onclick="executeImport()">確認匯入</button>
     </div>
   </div>
 </div>
@@ -1149,14 +1165,106 @@ function switchTab(tab) {
 function exportCSV() {
   const rows = [['日期','類別','金額','貨幣','備註','狀態']];
   [...data.expenses].sort((a,b)=>new Date(a.date)-new Date(b.date)).forEach(e => {
-    rows.push([e.date, e.catName, e.amount.toFixed(2), e.currency, e.note || '', e.settled ? '已結算' : '未結算']);
+    rows.push([e.date, e.catName, e.amount.toFixed(2), e.currency, e.note || '', e.settled ? '已找數' : '未找數']);
   });
   const csv = '\uFEFF' + rows.map(r => r.map(v => `"${String(v).replace(/"/g,'""')}"`).join(',')).join('\n');
   const a = document.createElement('a');
   a.href = URL.createObjectURL(new Blob([csv], {type:'text/csv;charset=utf-8'}));
-  a.download = `帳目_${new Date().toISOString().slice(0,10)}.csv`;
+  a.download = `PayPayWife_${new Date().toISOString().slice(0,10)}.csv`;
   a.click();
   showToast('📥 CSV 已匯出');
+}
+
+let pendingImportRows = [];
+
+function handleImportFile(event) {
+  const file = event.target.files[0];
+  if (!file) return;
+  const reader = new FileReader();
+  reader.onload = function(e) {
+    const text = e.target.result.replace(/^\uFEFF/, ''); // strip BOM
+    const lines = text.trim().split('\n');
+    if (lines.length < 2) { showToast('⚠️ CSV 格式不正確'); return; }
+
+    // Parse CSV rows (handle quoted fields)
+    function parseCSVLine(line) {
+      const result = [];
+      let cur = '', inQuote = false;
+      for (let i = 0; i < line.length; i++) {
+        const ch = line[i];
+        if (ch === '"') {
+          if (inQuote && line[i+1] === '"') { cur += '"'; i++; }
+          else inQuote = !inQuote;
+        } else if (ch === ',' && !inQuote) {
+          result.push(cur.trim()); cur = '';
+        } else cur += ch;
+      }
+      result.push(cur.trim());
+      return result;
+    }
+
+    const header = parseCSVLine(lines[0]).map(h => h.toLowerCase());
+    const dateIdx    = header.findIndex(h => h.includes('日期') || h === 'date');
+    const catIdx     = header.findIndex(h => h.includes('類別') || h === 'category');
+    const amtIdx     = header.findIndex(h => h.includes('金額') || h === 'amount');
+    const curIdx     = header.findIndex(h => h.includes('貨幣') || h === 'currency');
+    const noteIdx    = header.findIndex(h => h.includes('備註') || h === 'note');
+    const statusIdx  = header.findIndex(h => h.includes('狀態') || h === 'status');
+
+    if (dateIdx < 0 || amtIdx < 0) { showToast('⚠️ 找不到日期或金額欄位'); return; }
+
+    const existingKeys = new Set(data.expenses.map(e => `${e.date}_${e.amount}_${e.currency}`));
+    pendingImportRows = [];
+
+    for (let i = 1; i < lines.length; i++) {
+      if (!lines[i].trim()) continue;
+      const cols = parseCSVLine(lines[i]);
+      const date     = cols[dateIdx]  || '';
+      const catName  = catIdx >= 0  ? cols[catIdx]  : '其他';
+      const amount   = parseFloat(cols[amtIdx]) || 0;
+      const currency = curIdx >= 0  ? cols[curIdx]  : 'HKD';
+      const note     = noteIdx >= 0 ? cols[noteIdx] : '';
+      const settled  = statusIdx >= 0 && (cols[statusIdx].includes('已') || cols[statusIdx].toLowerCase().includes('settled'));
+
+      if (!date || amount <= 0) continue;
+      const key = `${date}_${amount}_${currency}`;
+      if (existingKeys.has(key)) continue; // skip duplicates
+
+      const cat = CATEGORIES.find(c => c.name === catName) || CATEGORIES[CATEGORIES.length - 1];
+      pendingImportRows.push({ id: Date.now() + i, cat: cat.id, catName: cat.name, catIcon: cat.icon, amount, currency, date, note, settled, settledAt: settled ? date : null });
+    }
+
+    // Show preview modal
+    const previewText = document.getElementById('import-preview-text');
+    const previewList = document.getElementById('import-preview-list');
+    if (pendingImportRows.length === 0) {
+      previewText.textContent = '沒有新紀錄需要匯入（全部已存在）。';
+      previewList.innerHTML = '';
+    } else {
+      previewText.textContent = `找到 ${pendingImportRows.length} 筆新紀錄：`;
+      previewList.innerHTML = pendingImportRows.map(r =>
+        `<div style="padding:3px 0;border-bottom:1px solid var(--border-dim)">${r.catIcon} ${r.catName} ${r.currency} ${r.amount.toFixed(2)} · ${r.date}${r.note ? ' · '+r.note : ''}</div>`
+      ).join('');
+    }
+    document.getElementById('import-modal-overlay').classList.add('open');
+    event.target.value = ''; // reset file input
+  };
+  reader.readAsText(file, 'UTF-8');
+}
+
+function executeImport() {
+  if (pendingImportRows.length === 0) { closeImportModal(); return; }
+  data.expenses.push(...pendingImportRows);
+  saveData(); renderAll();
+  closeImportModal();
+  showToast(`✅ 已匯入 ${pendingImportRows.length} 筆紀錄`);
+  pendingImportRows = [];
+}
+
+function closeImportModal(e) {
+  if (e && e.target !== document.getElementById('import-modal-overlay')) return;
+  document.getElementById('import-modal-overlay').classList.remove('open');
+  pendingImportRows = [];
 }
 
 function showToast(msg) {
